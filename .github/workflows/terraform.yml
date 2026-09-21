@@ -73,7 +73,7 @@ jobs:
 
       - run: docker run --rm -v "${{ github.workspace }}:/repo" aquasec/trivy@sha256:029e990b328d149bf0a9ffe355919041e1f86192db2df47e217f8a36dd42ceac config --exit-code 1 --severity HIGH,CRITICAL /repo # v0.59.1
 
-      - uses: terraform-linters/setup-tflint@90f302c255ef959cbfb4bd10581afecdb7ece3e6 # v4.1.1
+      - uses: terraform-linters/setup-tflint@1cf010d3c7aef302051ccdb68c14c5dc2efa34ef # v6.3.1
       - run: tflint --init
       - run: tflint --recursive
 
