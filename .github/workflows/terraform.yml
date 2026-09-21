@@ -1,0 +1,317 @@
+name: Terraform
+
+# Run plans for pull requests and every branch push; only main is eligible to apply.
+on:
+  pull_request:
+    paths:
+      - "**.tf"
+      - "environments/**"
+      - ".github/workflows/terraform.yml"
+  push:
+    branches:
+      - "**"
+    paths:
+      - "**.tf"
+      - "environments/**"
+      - ".github/workflows/terraform.yml"
+permissions:
+  # OIDC requires id-token: write; no Azure client secret is stored in GitHub.
+  contents: read
+  id-token: write
+  pull-requests: write
+  security-events: write
+
+# Prevent duplicate runs for the same branch or pull request from competing for state.
+concurrency:
+  group: terraform-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+
+jobs:
+  # Fast syntax and provider-schema validation without accessing Azure.
+  validate:
+    name: Format and validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: 1.14.8
+
+      - run: terraform fmt -check -recursive
+      - run: terraform init -backend=false
+      - run: terraform validate
+
+  # Static security and quality gates for Terraform configuration.
+  security:
+    name: DevSecOps checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: aquasecurity/tfsec-action@b466648d6e39e7c75324f25d83891162a721f2d6 # v1.0.3
+        with:
+          format: sarif
+          additional_args: --out tfsec.sarif
+          soft_fail: false
+
+      - uses: github/codeql-action/upload-sarif@a65a038433a26f4363cf9f029e3b9ceac831ad5d # v3.28.10
+        if: always()
+        with:
+          sarif_file: tfsec.sarif
+
+      - uses: bridgecrewio/checkov-action@99bb2caf247dfd9f03cf984373bc6043d4e32ebf # v12.1347.0
+        with:
+          directory: .
+          framework: terraform
+          output_format: cli
+          soft_fail: false
+
+      - run: docker run --rm -v "${{ github.workspace }}:/repo" aquasec/trivy@sha256:029e990b328d149bf0a9ffe355919041e1f86192db2df47e217f8a36dd42ceac config --exit-code 1 --severity HIGH,CRITICAL /repo # v0.59.1
+
+      - uses: terraform-linters/setup-tflint@90f302c255ef959cbfb4bd10581afecdb7ece3e6 # v4.1.1
+      - run: tflint --init
+      - run: tflint --recursive
+
+  # Plan both environments independently against their own remote state keys.
+  plan:
+    name: Plan ${{ matrix.environment }}
+    needs:
+      - validate
+      - security
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    strategy:
+      fail-fast: false
+      matrix:
+        environment:
+          - nonprd
+          - prd
+    runs-on: ubuntu-latest
+    environment: terraform-${{ matrix.environment }}-plan
+    concurrency:
+      group: terraform-plan-${{ matrix.environment }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    env:
+      ALLOW_DESTRUCTIVE_CHANGES: ${{ vars.ALLOW_DESTRUCTIVE_CHANGES || 'false' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: 1.14.8
+
+      - uses: azure/login@d19a4f1b3c068b799dff7574ac265b0144f415fe # v2.2.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.CONNECTIVITY_SUBSCRIPTION_ID }}
+
+      - run: terraform init -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" -backend-config="key=${{ matrix.environment }}/connectivity.tfstate"
+        env:
+          ARM_USE_OIDC: true
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.CONNECTIVITY_SUBSCRIPTION_ID }}
+          TF_VAR_tenant_id: ${{ vars.AZURE_TENANT_ID }}
+          TF_VAR_connectivity_subscription_id: ${{ vars.CONNECTIVITY_SUBSCRIPTION_ID }}
+          TF_VAR_workload_subscription_id: ${{ vars.WORKLOAD_SUBSCRIPTION_ID }}
+      - run: terraform plan -lock-timeout=5m -out=tfplan -var-file=environments/${{ matrix.environment }}.tfvars
+        env:
+          ARM_USE_OIDC: true
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.CONNECTIVITY_SUBSCRIPTION_ID }}
+          TF_VAR_tenant_id: ${{ vars.AZURE_TENANT_ID }}
+          TF_VAR_connectivity_subscription_id: ${{ vars.CONNECTIVITY_SUBSCRIPTION_ID }}
+          TF_VAR_workload_subscription_id: ${{ vars.WORKLOAD_SUBSCRIPTION_ID }}
+      # Convert the plan to JSON so destructive actions can be blocked before approval.
+      - name: Check destructive changes
+        shell: bash
+        run: |
+          terraform show -json tfplan > tfplan.json
+          destructive_count=$(jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length' tfplan.json)
+          if [[ "${ALLOW_DESTRUCTIVE_CHANGES}" != "true" && "${destructive_count}" -gt 0 ]]; then
+            echo "::error::Plan contains ${destructive_count} deletes or replacements. Set ALLOW_DESTRUCTIVE_CHANGES=true only through an approved break-glass process."
+            jq -r '.resource_changes[]? | select(.change.actions | index("delete")) | "\(.address): \(.change.actions | join(","))"' tfplan.json
+            exit 1
+          fi
+
+      # Keep a compact governance record in the artifact and expose it in the pull request.
+      - name: Create plan summary
+        shell: bash
+        run: |
+          plan_result=$(terraform show -no-color tfplan | grep -E 'Plan:|No changes' || true)
+          added_count=$(jq '[.resource_changes[]? | select((.change.actions | index("create")) and ((.change.actions | index("delete")) | not))] | length' tfplan.json)
+          modified_count=$(jq '[.resource_changes[]? | select(.change.actions == ["update"])] | length' tfplan.json)
+          deleted_count=$(jq '[.resource_changes[]? | select(.change.actions == ["delete"])] | length' tfplan.json)
+          replaced_count=$(jq '[.resource_changes[]? | select((.change.actions | index("create")) and (.change.actions | index("delete")))] | length' tfplan.json)
+          resource_summary=$(jq -r '.resource_changes[]? | "- \(.address): \(.change.actions | join(", "))"' tfplan.json | head -40)
+          destructive_count=$(jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length' tfplan.json)
+          {
+            echo "<!-- terraform-plan-${{ matrix.environment }} -->"
+            echo "## Terraform plan: ${{ matrix.environment }}"
+            echo
+            echo "Commit: \\`${GITHUB_SHA}\\`"
+            echo "State key: \\`${{ matrix.environment }}/connectivity.tfstate\\`"
+            echo ""
+            echo "### Architecture summary"
+            echo "- Connectivity resources use the connectivity subscription provider."
+            echo "- Workload spoke resources use the workload subscription provider."
+            echo "- The hub-spoke module is enabled only when the environment foundation flag is true."
+            echo ""
+            echo "### Resource impact"
+            echo "- Added: ${added_count}"
+            echo "- Modified: ${modified_count}"
+            echo "- Deleted: ${deleted_count}"
+            echo "- Replaced: ${replaced_count}"
+            echo ""
+            echo "${resource_summary}"
+            echo ""
+            echo "\\`\\`\\`text"
+            echo "${plan_result}"
+            echo "\\`\\`\\`"
+            echo ""
+            echo "### Risk analysis"
+            if [[ "${destructive_count}" -gt 0 ]]; then
+              echo "Destructive actions are present and require the approved break-glass setting."
+            else
+              echo "No deletes or replacements were detected. Review updates and newly created resources before approval."
+            fi
+            echo ""
+            echo "### Rollback plan"
+            echo "Do not apply this artifact if the review is not approved. Revert the pull request and apply a reviewed corrective plan; imported resources remain unchanged unless this saved plan is applied."
+            echo ""
+            echo "### Validation"
+            echo "Terraform fmt, validate, tfsec, Checkov, Trivy, and TFLint are required upstream checks."
+            echo ""
+            echo "### CAF compliance"
+            echo "This plan uses remote state, OIDC, environment-specific state isolation, CAF naming, enterprise tags, and import-first brownfield controls."
+            echo ""
+            echo "Full binary and JSON plans are attached as workflow artifacts."
+          } > plan-summary.md
+
+      - name: Update pull request plan comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = `<!-- terraform-plan-${{ matrix.environment }} -->`;
+            const body = fs.readFileSync('plan-summary.md', 'utf8');
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100
+            });
+            const existing = comments.find(comment => comment.user.type === 'Bot' && comment.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body });
+            }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: terraform-plan-${{ matrix.environment }}
+          retention-days: 5
+          path: |
+            tfplan
+            tfplan.json
+            plan-summary.md
+
+  # Apply the exact non-production plan only after a main-branch push.
+  apply-nonprd:
+    name: Apply non-production
+    needs: plan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: terraform-nonprd-apply
+    concurrency:
+      group: terraform-apply-nonprd
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: 1.14.8
+
+      - uses: azure/login@d19a4f1b3c068b799dff7574ac265b0144f415fe # v2.2.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.CONNECTIVITY_SUBSCRIPTION_ID }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: terraform-plan-nonprd
+
+      - run: terraform init -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" -backend-config="key=nonprd/connectivity.tfstate"
+        env:
+          ARM_USE_OIDC: true
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.CONNECTIVITY_SUBSCRIPTION_ID }}
+          TF_VAR_tenant_id: ${{ vars.AZURE_TENANT_ID }}
+          TF_VAR_connectivity_subscription_id: ${{ vars.CONNECTIVITY_SUBSCRIPTION_ID }}
+          TF_VAR_workload_subscription_id: ${{ vars.WORKLOAD_SUBSCRIPTION_ID }}
+      - run: terraform apply -lock-timeout=5m -auto-approve tfplan
+        env:
+          ARM_USE_OIDC: true
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.CONNECTIVITY_SUBSCRIPTION_ID }}
+          TF_VAR_tenant_id: ${{ vars.AZURE_TENANT_ID }}
+          TF_VAR_connectivity_subscription_id: ${{ vars.CONNECTIVITY_SUBSCRIPTION_ID }}
+          TF_VAR_workload_subscription_id: ${{ vars.WORKLOAD_SUBSCRIPTION_ID }}
+
+  # Apply production only after non-production succeeds and the protected environment approves it.
+  apply-prd:
+    name: Apply production
+    needs: apply-nonprd
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: terraform-prd-apply
+    concurrency:
+      group: terraform-apply-prd
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: 1.14.8
+
+      - uses: azure/login@d19a4f1b3c068b799dff7574ac265b0144f415fe # v2.2.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.CONNECTIVITY_SUBSCRIPTION_ID }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: terraform-plan-prd
+
+      - run: terraform init -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" -backend-config="key=prd/connectivity.tfstate"
+        env:
+          ARM_USE_OIDC: true
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.CONNECTIVITY_SUBSCRIPTION_ID }}
+          TF_VAR_tenant_id: ${{ vars.AZURE_TENANT_ID }}
+          TF_VAR_connectivity_subscription_id: ${{ vars.CONNECTIVITY_SUBSCRIPTION_ID }}
+          TF_VAR_workload_subscription_id: ${{ vars.WORKLOAD_SUBSCRIPTION_ID }}
+      - run: terraform apply -lock-timeout=5m -auto-approve tfplan
+        env:
+          ARM_USE_OIDC: true
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.CONNECTIVITY_SUBSCRIPTION_ID }}
+          TF_VAR_tenant_id: ${{ vars.AZURE_TENANT_ID }}
+          TF_VAR_connectivity_subscription_id: ${{ vars.CONNECTIVITY_SUBSCRIPTION_ID }}
+          TF_VAR_workload_subscription_id: ${{ vars.WORKLOAD_SUBSCRIPTION_ID }}
