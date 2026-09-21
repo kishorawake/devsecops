@@ -1,0 +1,15 @@
+# Copy this file only for local validation; never commit real identifiers or secrets.
+tenant_id                    = "00000000-0000-0000-0000-000000000000"
+connectivity_subscription_id = "00000000-0000-0000-0000-000000000000"
+workload_subscription_id     = "00000000-0000-0000-0000-000000000000"
+environment                  = "nonprd"
+location                     = "eastus"
+location_short               = "eus"
+workload_name                = "platform"
+
+create_foundation = false
+
+tags = {
+  Repository = "https://github.com/ORG/REPO"
+  CostCenter = "CC0000"
+}
